@@ -1,88 +1,156 @@
-
-
-
-# Install required libraries (uncomment the next three lines if these libraries are not installed)
-# !pip install transformers
-# !pip install sentencepiece
-# !pip install torch
-
+!pip install datasets
+import pandas as pd
 import torch
-from transformers import XLMRobertaTokenizer, XLMRobertaModel
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
+import re
 import numpy as np
+from datasets import Dataset
+from transformers import XLMRobertaTokenizer, XLMRobertaModel, XLMRobertaForSequenceClassification, Trainer, TrainingArguments
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.metrics import accuracy_score
+from nltk.corpus import wordnet
+import random
+from torch.cuda.amp import autocast
+import nltk
+nltk.download('wordnet')
+# -------------------------------
+# 1️⃣ LOAD DATASET & PREPROCESSING
+# -------------------------------
+file_path = "/content/data.csv"
+df = pd.read_csv(file_path, encoding="utf-8").dropna()
 
-# Define the XLM-R model and tokenizer
-model_name = "xlm-roberta-base"
-model = XLMRobertaModel.from_pretrained(model_name)
+# Convert sentiment labels to numeric categories
+df["sentiment"] = df["sentiment"].map({"1 star": 0, "2 stars": 0, "3 stars": 1, "4 stars": 2, "5 stars": 2})
+
+# Clean text function
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'http\S+|www\S+', '', text)  # Remove URLs
+    text = re.sub(r'[^a-zA-Z0-9À-ÿ\s]', '', text)  # Remove special characters
+    text = re.sub(r'\s+', ' ', text).strip()  # Remove extra spaces
+    return text
+
+df["tweet"] = df["tweet"].apply(clean_text)
+
+# -------------------------------
+# 2️⃣ DATA AUGMENTATION (Synonym Replacement)
+# -------------------------------
+def synonym_replacement(sentence, num_words=2):
+    words = sentence.split()
+    new_words = words.copy()
+    random_words = random.sample(words, min(num_words, len(words)))
+    for word in random_words:
+        synonyms = wordnet.synsets(word)
+        if synonyms:
+            synonym = synonyms[0].lemmas()[0].name()
+            new_words = [synonym if w == word else w for w in new_words]
+    return " ".join(new_words)
+
+df["tweet_augmented"] = df["tweet"].apply(synonym_replacement)
+df_augmented = df[["tweet_augmented", "sentiment"]].rename(columns={"tweet_augmented": "tweet"})
+df = pd.concat([df, df_augmented], ignore_index=True)
+
+# Split data into train and test sets
+train_texts, test_texts, train_labels, test_labels = train_test_split(df["tweet"].tolist(), df["sentiment"].tolist(), test_size=0.2, random_state=42)
+
+# -------------------------------
+# 3️⃣ TRAIN XLM-RoBERTa CLASSIFIER
+# -------------------------------
+model_name = "xlm-roberta-large"
 tokenizer = XLMRobertaTokenizer.from_pretrained(model_name)
+model_xlmr = XLMRobertaForSequenceClassification.from_pretrained(model_name, num_labels=3).to("cuda")
 
-# Initialize the SVM classifier
-svm_classifier = SVC(probability=True)
-scaler = StandardScaler()  # For normalizing the features
+# Tokenization
+def tokenize_function(examples):
+    return tokenizer(examples, padding=True, truncation=True, max_length=256)
 
-# Corrected training data and labels
-train_texts = [
-    "I don't love this product!",  # Negative
-    "This is a great product.",    # Positive
-    "The product is amazing",      # Positive
-    "Je suis très heureux d'apprendre cela.",  # Positive
-    "Esto es fantástico y emocionante.",       # Positive
-    "This is the worst thing I've ever used.", # Negative
-    "Terrible experience, will never buy again.", # Negative
-]
+train_encodings = tokenize_function(train_texts)
+test_encodings = tokenize_function(test_texts)
 
-train_labels = [0, 1, 1, 1, 1, 0, 0]  # 0 for negative, 1 for positive
+class SentimentDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+    def __len__(self):
+        return len(self.labels)
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
 
-# Tokenize and encode the training data
-train_inputs = tokenizer(train_texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
+train_dataset = SentimentDataset(train_encodings, train_labels)
+test_dataset = SentimentDataset(test_encodings, test_labels)
 
-# Extract hidden states from the XLM-R model
-with torch.no_grad():
-    train_hidden_states = model(**train_inputs).last_hidden_state  # Shape: (batch_size, seq_len, hidden_size)
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    logging_dir="./logs",
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    num_train_epochs=3,
+    learning_rate=2e-5,
+    weight_decay=0.01,
+    logging_steps=10,
+    load_best_model_at_end=True,
+)
 
-# Average pooling to get sentence-level embeddings
-train_embeddings = train_hidden_states.mean(dim=1).numpy()  # Shape: (batch_size, hidden_size)
+trainer = Trainer(
+    model=model_xlmr,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
+    tokenizer=tokenizer,
+)
 
-# Normalize the embeddings
-train_embeddings = scaler.fit_transform(train_embeddings)
+trainer.train()
+eval_results = trainer.evaluate()
+accuracy_xlmr = eval_results.get("eval_accuracy", 0) * 100
 
-# Fit the SVM classifier with normalized embeddings
-svm_classifier.fit(train_embeddings, train_labels)
+# -------------------------------
+# 4️⃣ TOKENIZATION & EMBEDDING EXTRACTION (Optimized)
+# -------------------------------
+model = XLMRobertaModel.from_pretrained(model_name).to("cuda")
+model = torch.compile(model)
 
-# Multilingual sentiment analysis function
-def multilingual_sentiment_analysis(texts):
-    # Tokenize and encode the input text
-    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
+def get_embeddings(texts, batch_size=16):
+    embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
+        inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=256).to("cuda")
+        with torch.no_grad(), autocast():
+            outputs = model(**inputs)
+        batch_embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+        embeddings.append(batch_embeddings)
+    return np.vstack(embeddings)
 
-    # Extract hidden states from the XLM-R model
-    with torch.no_grad():
-        hidden_states = model(**inputs).last_hidden_state  # Shape: (batch_size, seq_len, hidden_size)
+X_train = get_embeddings(train_texts, batch_size=16)
+X_test = get_embeddings(test_texts, batch_size=16)
 
-    # Average pooling to get sentence-level embeddings
-    embeddings = hidden_states.mean(dim=1).numpy()  # Shape: (batch_size, hidden_size)
+# -------------------------------
+# 5️⃣ TRAIN XGBOOST CLASSIFIER
+# -------------------------------
+xgb = XGBClassifier(n_estimators=200, learning_rate=0.05, max_depth=8, colsample_bytree=0.8, early_stopping_rounds=50)
+xgb.fit(X_train, train_labels, eval_set=[(X_test, test_labels)], verbose=True)
+y_pred_xgb = xgb.predict(X_test)
+accuracy_xgb = accuracy_score(test_labels, y_pred_xgb) * 100
 
-    # Normalize the embeddings
-    embeddings = scaler.transform(embeddings)
+# -------------------------------
+# 6️⃣ TRAIN LIGHTGBM CLASSIFIER
+# -------------------------------
+lgbm = LGBMClassifier(n_estimators=200, learning_rate=0.05, max_depth=8)
+lgbm.fit(X_train, train_labels)
+y_pred_lgbm = lgbm.predict(X_test)
+accuracy_lgbm = accuracy_score(test_labels, y_pred_lgbm) * 100
 
-    # Classify the sentiment using the pre-trained SVM classifier
-    svm_predictions = svm_classifier.predict(embeddings)
-
-    return svm_predictions
-
-# Example statements for sentiment analysis
-statements = [
-    "I don't love this product!",
-    "The product is amazing",
-    "Je suis très heureux d'apprendre cela.",
-    "Esto es fantástico y emocionante.",
-    "This is the worst thing I've ever used.",
-    "Terrible experience, will never buy again.",
-]
-
-# Perform sentiment analysis
-sentiment_predictions = multilingual_sentiment_analysis(statements)
-
-# Display the sentiment predictions (0 for negative, 1 for positive)
-for statement, sentiment in zip(statements, sentiment_predictions):
-    print(f"Statement: {statement}\nSentiment: {'Positive' if sentiment == 1 else 'Negative'}\n")
+# -------------------------------
+# 7️⃣ SAVE MODELS & PRINT ACCURACY
+# -------------------------------
+print(f"✅ Model fine-tuned and saved successfully!")
+print(f"🎯 XLM-RoBERTa Accuracy: {accuracy_xlmr:.2f}%")
+print(f"🎯 XGBoost Accuracy: {accuracy_xgb:.2f}%")
+print(f"🎯 LightGBM Accuracy: {accuracy_lgbm:.2f}%")
+final_accuracy = (accuracy_xgb + accuracy_lgbm ) / 2
+print(f"🚀 Final Model Accuracy ( XGBoost + LightGBM): {final_accuracy:.2f}%")
